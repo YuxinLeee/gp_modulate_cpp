@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<package>
+  <name>locally_modulated_ds</name>
+  <version>0.0.0</version>
+  <description>The locally_modulated_ds package</description>
+
+
+  <maintainer email="klas.kronander@epfl.ch">klas</maintainer>
+
+
+  <license>MIT</license>
+
+
+  <!-- <buildtool_depend>catkin</buildtool_depend> -->
+  <build_depend>gaussian_process_regression</build_depend>
+  <run_depend>gaussian_process_regression</run_depend>
+
+  <export>
+
+  </export>
+</package>
