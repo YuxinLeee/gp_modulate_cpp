@@ -13,7 +13,7 @@ using Vec = LinearVelocityField::Vec;
 
 
 int main(){
-  /**
+  
   // 1) 打开 MAT 文件
   mat_t *matfp = Mat_Open("/Users/macpro/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat/2.0b4.0.9/969743b82696fc3d2e7630b589d93917/Message/MessageTemp/9e20f478899dc29eb19741386f9343c8/File/project/Manipulability-master/ds_control.mat", MAT_ACC_RDONLY);
   if(!matfp){
@@ -37,8 +37,8 @@ int main(){
   }
 
   // 打印 Priors
-  std::cout << "Priors (1x" << K << "):" << std::endl;
-  std::cout << Priors << std::endl;
+  // std::cout << "Priors (1x" << K << "):" << std::endl;
+  // std::cout << Priors << std::endl;
 
   // 4) Mu
   matvar_t *mu_var = Mat_VarGetStructFieldByName(gmm_var, "Mu", 0);
@@ -53,8 +53,8 @@ int main(){
   }
 
   // 打印 Mu
-  std::cout << "Mu (" << M << "x" << K << "):" << std::endl;
-  std::cout << Mu << std::endl;
+  // std::cout << "Mu (" << M << "x" << K << "):" << std::endl;
+  // std::cout << Mu << std::endl;
 
   // 5) Sigma (3D: M×M×K，在 MAT-file 中一般展平为 (K*M)×M)
   matvar_t *sigma_var = Mat_VarGetStructFieldByName(gmm_var, "Sigma", 0);
@@ -71,8 +71,8 @@ int main(){
   }
 
   // 打印 Sigma
-  std::cout << "Sigma (" << sigma_rows << "x" << sigma_cols << "):" << std::endl;
-  std::cout << Sigma << std::endl;
+  // std::cout << "Sigma (" << sigma_rows << "x" << sigma_cols << "):" << std::endl;
+  // std::cout << Sigma << std::endl;
 
   // 6) A_k （3D 数组: D×D×K）
   matvar_t *A_var = Mat_VarRead(matfp, "A_k");
@@ -89,8 +89,8 @@ int main(){
   }
 
   // 打印 A
-  std::cout << "A (" << K*D << "x" << D << "):" << std::endl;
-  std::cout << A << std::endl;
+  // std::cout << "A (" << K*D << "x" << D << "):" << std::endl;
+  // std::cout << A << std::endl;
 
   // 7) Attractor (att)
   matvar_t *att_var = Mat_VarRead(matfp, "att");
@@ -109,86 +109,36 @@ int main(){
     }
 
     // 打印 Attractor
-    std::cout << "Attractor (" << att_dim << "x1):" << std::endl;
-    std::cout << att << std::endl;
+    // std::cout << "Attractor (" << att_dim << "x1):" << std::endl;
+    // std::cout << att << std::endl;
   }
   
-  
 
 
-    //   7) 构造 lpvDS 对象
-    //  我们这里用 vector<double> 版本的构造器：
-//      lpvDS(int K, int M, const vector<double>& Priors,
-//            const vector<double>& Mu, const vector<double>& Sigma,
-//            const vector<double>& A);
-//   lpvDS lpvds_obj(static_cast<int>(K),
-//                   static_cast<int>(D),  // M == D
-//                   Priors,
-//                   Mu,
-//                   Sigma,
-//                   A);
+// Step 1: Define your DS
 
-  // std::cout << "成功构造 lpvDS 对象！\n";
+// int Dd = 3;
+// Mat Aa = -0.4*Mat::Identity(Dd,Dd);
+// Vec target(Dd);
+// LinearVelocityField ds_field(target,Aa,5);
 
-  // 记得清理
-//   Mat_VarFree(priors_var);
-//   Mat_VarFree(mu_var);
-//   Mat_VarFree(sigma_var);
-//   Mat_VarFree(A_var);
-//   Mat_VarFree(gmm_var);
-//   Mat_Close(matfp);
-**/
+lpvDS ds_field(K, 3, Priors, Mu, Sigma, A, att);
 
-// // Step 1: Define your DS
-int Dd = 3;
-Mat Aa = -0.4*Mat::Identity(Dd,Dd);
-Vec target(Dd);
-LinearVelocityField ds_field(target,Aa,5);
-
-// lpvDS lpvds_obj(K, 3, Priors, Mu, Sigma, A, att);
-
-
-Eigen::Matrix<double, 3, 1> currpos(-0.523821, 0.158865, 0.387647);
-// Vec vel2 = lpvds_obj(currpos);
-// std::cout << "Velcocity of lpvDS: " << vel2 << std::endl;
-
-
-// to evaluate the system:
-// Eigen::Matrix<double, 3, 1> currpos(1.3, 1.3, 1.3);
+// Evaluate the system:
+Eigen::Matrix<double, 3, 1> currpos(1.2, 1.2, 1.2);
 Vec vel = ds_field(currpos);
 std::cout << "Velocity of ds_field (before): " << vel << std::endl;
 
 
-// Step 2: Define GP
+// Define Gaussian Process
 GaussianProcessModulatedDS<double> gpmds_(ds_field); // provide the original dynamics to the constructor
 gpmds_.get_gpr()->SetHyperParams(0.1, 1.0, 0.0001);
 
 
-// GaussianProcessModulatedDS<double> gpmds_(lpvds_obj); // provide the original dynamics to the constructor
-// gpmds_.get_gpr()->SetHyperParams(0.1, 1.0, 0.0001);
-
-
-// Step 3: Provide Modulation Data
-// Eigen::Matrix<double, 3,1> training_pos, training_vel;
-// training_pos << 1,1,1;
-// training_vel << 10.0,10.0,0.0;
-// gpmds_.AddData(training_pos, training_vel); // add a single training point,
-
-
-// Eigen::MatrixXd training_pos(3, 2), training_vel(3, 2);
-// training_pos << 1,1,1,
-//                 1.2, 1.2, 1.2;
- 
-// training_vel <<  -1.0, -2.0, 0.0,
-//                  -1.0, -5.0, 0.0; 
-
-
+// Provide Modulation Data
 const int dim = 3;        // dimensionality (e.g., x, y, z)
 const int num_samples = 20; // number of samples
 double stddev = 0.1; // standard deviation of the Gaussian noise
-
-// std::cout << num_samples << std::endl; 
-
 
 Eigen::VectorXd mean_pos(dim);
 mean_pos << 1.0, 1.2, 1.2;
@@ -198,14 +148,8 @@ mean_vel << -1.0, -2.0, 0.0;
 
 std::vector<Vec> pos_vecs, vel_vecs;
 
-// Random number generation with standard normal distribution
-// std::random_device rd;
-// std::mt19937 gen(rd());
-// std::normal_distribution<> normal_dist(0.0, 0.05); // stddev = 0.05
-
 Eigen::MatrixXd training_pos(dim, num_samples);
 Eigen::MatrixXd training_vel(dim, num_samples);
-
 
 // Random number generator
 std::random_device rd;
@@ -213,20 +157,16 @@ std::mt19937 gen(rd());
 std::normal_distribution<> dist(0.0, stddev);
 std::normal_distribution<> dist2(0.0, 0.01);
 
-
-
 for (int i = 0; i < num_samples; ++i) {
     training_pos.col(i) = mean_pos.unaryExpr([&](double m) { return m + dist(gen); });
     training_vel.col(i) = mean_vel.unaryExpr([&](double m) { return m + dist2(gen); });
 }
-// training_vel = mean_vel.replicate(1, num_samples);
 
+
+
+
+// Begin Modulation
 gpmds_.AddDataBatch(training_pos, training_vel); // add a single training point,
-
-
-// gpmds_.AddDataBatch(training_pos, training_vel); // add a single training point,
-// Eigen::Matrix<double, 3, 1> test_pos(1, 1, 1);
-
 auto output_vel = gpmds_.GetOutput(currpos);
 std::cout << output_vel << std::endl;
 

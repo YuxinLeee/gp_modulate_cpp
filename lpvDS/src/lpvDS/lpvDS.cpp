@@ -427,7 +427,7 @@ VectorXd lpvDS::compute_gamma(VectorXd X){
 	else
         gamma = gamma/sum;
 
-    std::cout << "Gamma: " << gamma << std::endl;
+    // std::cout << "Gamma: " << gamma << std::endl;
 
     return gamma;
 }
