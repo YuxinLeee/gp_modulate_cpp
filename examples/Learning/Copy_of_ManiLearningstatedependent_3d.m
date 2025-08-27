@@ -1,0 +1,480 @@
+function ManipulabilityLearning
+addpath('../../fcts/');
+
+%% Parameters
+nbData = 100; % Number of datapoints in a trajectory
+nbSamples = 1; % Number of demonstrations
+nbIter = 10; % Number of iteration for the Gauss Newton algorithm (Riemannian manifold)
+nbIterEM = 10; % Number of iteration for the EM algorithm
+letter = 'C'; % Letter to use as dataset for demonstration data
+
+modelPD.nbStates = 5; %Number of Gaussians in the GMM over man. ellipsoids
+modelPD.nbVar = 6; % Dimension of the manifold and tangent space (1D input + 2^2 output)
+modelPD.nbVarOut = 3; % Dimension of the output
+modelPD.nbVarOutVec = modelPD.nbVarOut + modelPD.nbVarOut*(modelPD.nbVarOut-1)/2; % Dimension of the output in vector form
+modelPD.nbVarVec = modelPD.nbVar - modelPD.nbVarOut + modelPD.nbVarOutVec; % Dimension of the manifold and tangent space in vector form
+modelPD.nbVarCovOut = modelPD.nbVar + modelPD.nbVar*(modelPD.nbVar-1)/2; %Dimension of the output covariance
+modelPD.dt = 1E-2; % Time step duration
+modelPD.params_diagRegFact = 1E-4; % Regularization of covariance
+modelPD.Kp = 100; % Gain for position control in task space
+
+modelKin.nbStates = 5; % Number of states in the GMM over 2D Cartesian trajectories
+modelKin.nbVar = 4; % Number of variables [t,x1,x2]
+modelKin.dt = modelPD.dt; % Time step duration
+
+%% Create Franka robot
+% Create Franka Panda robot using Robotics Toolbox
+% 选择数据格式为 row 向量，重力方向可选
+robot = loadrobot('frankaEmikaPanda', ...
+                  'DataFormat','row', ...
+                  'Gravity',[0,0,-9.81]);
+              
+% 查看末端执行器 (end effector) 的名称
+showdetails(robot)
+% 通常末端链节叫 'panda_link8' 或者 'panda_hand'，记下来：
+endEffector = 'panda_link8';
+
+ik = inverseKinematics('RigidBodyTree', robot);
+ik.SolverParameters.PositionTolerance    = 1e-6;   % 1 µm
+ik.SolverParameters.OrientationTolerance = 1e-3;   % small orient error
+ik.SolverParameters.GradientTolerance    = 1e-6;
+ik.SolverParameters.StepTolerance        = 1e-8;
+ik.SolverParameters.MaxIterations        = 300;
+
+%% Load data and generating manipulability ellipsoids
+disp('Loading demonstration data...');
+dataPath = fullfile(fileparts(mfilename('fullpath')), '..', '..', 'data', '3D_Cshape_bottom_processed.mat');
+S = load(dataPath);  
+
+% initialPosition = S.trajectories(1:3,1,1); % First trajectory, first point
+% myWorld = Environment(initialPosition, 0.01);
+% Initial state: joint velocity and position
+% q = myWorld.robot.computeInverseKinematics(initialPosition, myWorld.robot.robot.homeConfiguration, ...
+%                 false, diag([1, -1, -1]));  %求end effector 处于 initialPosition 的关节配置 q
+
+initialGuess = robot.homeConfiguration;
+
+xIn(1,:) = (1:nbData) * modelPD.dt; % Time as input variable
+X = zeros(4,4,nbData*nbSamples); % Matrix storing t,x1,x2,x3 or all the demos
+X(1,1,:) = reshape(repmat(xIn,1,nbSamples),1,1,nbData*nbSamples); % Stores input
+Data=[];
+
+for n=1:nbSamples
+    s(n).Data=[];
+    pos = S.trajectories(1:3,:,n);
+    ori = S.trajectories(4:6,  :, n);
+
+
+    tOrig    = 1:size(pos,2);
+    tResamp  = linspace(1, size(pos,2), nbData);
+
+    posResamp = spline(tOrig, pos,   tResamp);   % 3×nbData
+    oriResamp = spline(tOrig, ori,   tResamp);   % 3×nbData
+
+    s(n).Data = [posResamp; oriResamp];
+
+    % dTmp = spline(1:size(pos,2), pos, linspace(1,size(pos,2),nbData)); %Resampling
+    % s(n).Data = [s(n).Data; dTmp];
+       
+    weights = [1, 1, 1, 1, 1, 1]; 
+    % Computing force/velocity manipulability ellipsoids, that will be later
+    % used for encoding a GMM in the force/velocity manip. ellip. manifold
+    % ik = inverseKinematics('RigidBodyTree', myWorld.robot.robot);
+
+    for t = 1: nbData
+        t
+        x = s(n).Data(1:3, t); % 直接取数据集的点
+        w = s(n).Data(4:6, t);
+        % tform = trvec2tform(x');
+        
+        % xxx = eul2tform(w', 'XYZ')
+        tform = trvec2tform(x') * eul2tform(w', 'XYZ');
+
+        % [q, solInfo] = ik('panda_link8', tform, weights, q);
+        % if solInfo.ExitFlag < 0
+        %     warning('IK failed at sample %d of trajectory %d, using last q0', t, n);
+        % end
+
+        [qSol, solInfo] = ik(endEffector, tform, weights, initialGuess);
+        initialGuess = qSol;
+
+        auxJ = geometricJacobian(robot, qSol, 'panda_link8');
+
+        % auxJ = myWorld.robot.robot.geometricJacobian(q, 'panda_link8');
+        J = auxJ(1:3,1:7); % Take only translational part for 3D manipulability
+        X(2:4,2:4,t+(n-1)*nbData) = J*J'; % Saving ME (3x3 matrix)
+    end
+    Data = [Data [xIn ; s(n).Data]]; % Storing time and positions
+end
+% SPD data in vector shape
+x = [reshape(X(1,1,:),1,nbData*nbSamples); symmat2vec(X(2:end,2:end,:))];
+x = [ Data(2,:); Data(3,:);Data(4,:); x ];  %就是 x1 x2 x3
+x(4,:)=[]   
+
+
+
+%% GMM parameters estimation
+disp('Learning GMM1 (3D Cartesian position)...');
+modelKin = init_GMM_stateBased(Data, modelKin); % Model for position
+modelKin = EM_GMM(Data, modelKin);
+
+disp('Learning GMM2 (Manipulability ellipsoids)...');
+% Initialisation on the manifold
+in=1:3; outMat=4:modelPD.nbVar; out = 4:modelPD.nbVarVec;
+modelPD = spd_init_GMM_kbins(x, modelPD, nbSamples,out);
+modelPD.Mu = zeros(size(modelPD.MuMan));
+L = zeros(modelPD.nbStates, nbData*nbSamples);
+xts = zeros(modelPD.nbVarVec, nbData*nbSamples, modelPD.nbStates);
+
+% EM for SPD matrices manifold
+for nb=1:nbIterEM
+    fprintf('.');
+    % E-step
+    for i=1:modelPD.nbStates
+        xts(in,:,i) = x(in,:)-repmat(modelPD.MuMan(in,i),1,nbData*nbSamples);
+        xts(out,:,i) = logmap_vec(x(out,:), modelPD.MuMan(out,i));
+        L(i,:) = modelPD.Priors(i) * gaussPDF(xts(:,:,i), modelPD.Mu(:,i), modelPD.Sigma(:,:,i));
+    end
+    % Responsibilities
+    GAMMA = L ./ repmat(sum(L,1)+realmin, modelPD.nbStates, 1);
+    H = GAMMA ./ repmat(sum(GAMMA,2)+realmin, 1, nbData*nbSamples);
+    
+    % M-step
+    for i=1:modelPD.nbStates
+        % Update Priors
+        modelPD.Priors(i) = sum(GAMMA(i,:)) / (nbData*nbSamples);
+        % Update MuMan
+        for n=1:nbIter
+            % Update on the tangent space
+            uTmp = zeros(modelPD.nbVarVec,nbData*nbSamples);
+            uTmp(in,:) = x(in,:) - repmat(modelPD.MuMan(in,i),1,nbData*nbSamples);
+            uTmp(out,:) = logmap_vec(x(out,:), modelPD.MuMan(out,i));
+            uTmpTot = sum(uTmp.*repmat(H(i,:),modelPD.nbVarVec,1),2);
+            % Update on the manifold
+            modelPD.MuMan(in,i) = uTmpTot(in,:) + modelPD.MuMan(in,i);
+            modelPD.MuMan(out,i) = expmap_vec(uTmpTot(out,:), modelPD.MuMan(out,i));
+        end
+        % Update Sigma
+        modelPD.Sigma(:,:,i) = uTmp * diag(H(i,:)) * uTmp' + eye(modelPD.nbVarVec) .* modelPD.params_diagRegFact;
+    end
+end
+% Eigendecomposition of Sigma
+for i=1:modelPD.nbStates
+    [V(:,:,i), D(:,:,i)] = eig(modelPD.Sigma(:,:,i));
+end
+modelPD.V = V;
+modelPD.D = D;
+
+save('modelPD.mat','modelPD');
+% Inputs
+xIn = zeros(3,nbSamples*nbData);  % 3*400 for 3D
+xIn(1,:) =  Data(2,:); 
+xIn(2,:) =  Data(3,:);
+xIn(3,:) =  Data(4,:);
+figure('position',[10 10 1200 550],'color',[1 1 1]);
+subplot(2,2,1); hold on;
+title('\fontsize{12}Manipulability field with input of 3d position');
+
+
+for t = 1:nbData
+    x_t = [ Data(2,t);
+            Data(3,t);
+            Data(4,t) ];
+    a   = GMR_mani_3d(x_t, modelPD)
+    plotGMM3D(x_t, 5E-3*vec2symmat(a), [0.2 0.8 0.2]); 
+end
+
+axis equal;
+set(gca, 'FontSize', 20)
+xlabel('$x_1$', 'Fontsize', 28, 'Interpreter', 'Latex');
+ylabel('$x_2$', 'Fontsize', 28, 'Interpreter', 'Latex');
+zlabel('$x_3$', 'Fontsize', 28, 'Interpreter', 'Latex');
+view(3);
+grid on;
+
+plot3(Data(2,1:50),Data(3,1:50),Data(4,1:50), 'color', [0.5 0.5 0.5], 'Linewidth', 2);
+
+b = GMR_mani_3d([0,0,0] , modelPD)
+plotGMM3D([0;0;0], 5E-3*vec2symmat(b), [0.2 0.8 1]); 
+c = GMR_mani_3d([1,1,1] , modelPD)
+plotGMM3D([1;1;1], 5E-3*vec2symmat(c), [0.2 0.8 1]); 
+d = GMR_mani_3d([-1,-1,-1] , modelPD)
+plotGMM3D([-1;-1;-1], 5E-3*vec2symmat(d), [0.2 0.8 1]); 
+
+
+%% GMR (version with single optimization loop)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+disp('Regression...');
+% Inputs
+xIn = zeros(3,nbSamples*nbData);  % 3*400 for 3D
+xIn(1,:) =  Data(2,:); 
+xIn(2,:) =  Data(3,:);
+xIn(3,:) =  Data(4,:);
+
+in=1:3; % Input dimension
+out=4:modelPD.nbVarVec; % Output dimensions for GMM over manipulabilities
+nbVarOut = length(out);
+outMan = 2:modelPD.nbVar;
+
+% Initialisations for GMR for manipulability ellipsoids
+uhat = zeros(nbVarOut,nbData);
+xhat = zeros(nbVarOut,nbData);
+uOut = zeros(nbVarOut,modelPD.nbStates,nbData);
+expSigma = zeros(nbVarOut,nbVarOut,nbData);
+H = [];
+
+for t=1:nbData
+    % GMR for 3D Cartesian trajectory
+    [xd(:,t), sigma_xd(:,:,t)] = GMR(modelKin, t*modelKin.dt, in, 2:modelKin.nbVar);
+    
+    % GMR for manipulability ellipsoids
+    % Compute activation weight
+    for i=1:modelPD.nbStates
+        H(i,t) = modelPD.Priors(i) * gaussPDF(xIn(:,t)-modelPD.MuMan(in,i),...
+            modelPD.Mu(in,i), modelPD.Sigma(in,in,i));
+    end
+    H(:,t) = H(:,t) / sum(H(:,t)+realmin);
+    % Compute conditional mean (with covariance transportation)
+    if t==1
+        [~,id] = max(H(:,t));
+        xhat(:,t) = modelPD.MuMan(out,id); % Initial point
+    else
+        xhat(:,t) = xhat(:,t-1);
+    end
+    % Iterative computation
+    for n=1:nbIter
+        uhat(:,t) = zeros(nbVarOut,1);
+        for i=1:modelPD.nbStates
+            % Transportation of covariance from model.MuMan(outMan,i) to xhat(:,t)
+            S1 = vec2symmat(modelPD.MuMan(out,i));
+            S2 = vec2symmat(xhat(:,t));
+            Ac = blkdiag(1,1,1,transp_operator(S1,S2));
+            % Parallel transport of eigenvectors
+            for j = 1:size(V,2)
+                a= V(in,j,i);
+                vMat(:,:,j,i) = blkdiag(diag(V(in,j,i)),vec2symmat(V(out,j,i)));
+                pvMat(:,:,j,i) = Ac * D(j,j,i)^.5 * vMat(:,:,j,i) * Ac';
+                pV(:,j,i) = [diag(pvMat(in,in,j,i)); symmat2vec(pvMat(outMat,outMat,j,i))];
+            end
+            % Parallel transported sigma (reconstruction from eigenvectors)
+            pSigma(:,:,i) = pV(:,:,i)*pV(:,:,i)';
+            % Gaussian conditioning on the tangent space
+            uOut(:,i,t) = logmap_vec(modelPD.MuMan(out,i), xhat(:,t)) + ...
+                pSigma(out,in,i)/pSigma(in,in,i)*(xIn(:,t)-modelPD.MuMan(in,i));
+            
+            uhat(:,t) = uhat(:,t) + uOut(:,i,t) * H(i,t);
+        end
+        % Projection back onto the manifold
+        xhat(:,t) = expmap_vec(uhat(:,t), xhat(:,t));
+    end 
+    % Compute conditional covariances
+    for i=1:modelPD.nbStates
+        SigmaOutTmp = pSigma(out,out,i) - pSigma(out,in,i)/pSigma(in,in,i)*pSigma(in,out,i);
+        expSigma(:,:,t) = expSigma(:,:,t) + H(i,t) * (SigmaOutTmp + uOut(:,i,t)*uOut(:,i,t)');
+    end
+    expSigma(:,:,t) = expSigma(:,:,t) - uhat(:,t)*uhat(:,t)';
+end
+
+%% Plots
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Plots in Cartesian space
+figure('position',[10 10 1800 600],'color',[1 1 1]);
+clrmap = lines(nbSamples);
+% Plot demonstrations of velocity manipulability ellipsoids
+subplot(1,3,1); hold on;
+title('\fontsize{12}Demonstrations: 3D Cartesian trajectories and manipulability ellipsoids');
+for n=1:nbSamples
+    for t=round(linspace(1,nbData,15))
+        plotGMM([s(n).Data(1,t);s(n).Data(2,t);s(n).Data(3,t)], 1E-1*X(2:4,2:4,t+(n-1)*nbData), clrmap(n,:), .4); % Scaled matrix!
+    end
+end
+for n=1:nbSamples % Plots 3D Cartesian trajectories
+    plot3(s(n).Data(1,:),s(n).Data(2,:),s(n).Data(3,:), 'color', [0.5 0.5 0.5], 'Linewidth', 2); % Scaled matrix!
+end
+axis equal;
+set(gca, 'FontSize', 20)
+xlabel('$x_1$', 'Fontsize', 28, 'Interpreter', 'Latex');
+ylabel('$x_2$', 'Fontsize', 28, 'Interpreter', 'Latex');
+zlabel('$x_3$', 'Fontsize', 28, 'Interpreter', 'Latex');
+
+% Plot desired reproduction
+subplot(1,3,3); hold on;
+title('\fontsize{12}Desired reproduction');
+for t=1:5:nbData % Plotting estimated man. ellipsoid from GMR
+    plotGMM(xIn(:,t), 5E-2*vec2symmat(xhat(:,t)), [0.2 0.8 0.2], .5, '-.', 2, 1); % Scaled matrix!
+end
+axis equal;
+set(gca, 'FontSize', 20)
+xlabel('$x_1$', 'Fontsize', 28, 'Interpreter', 'Latex');
+ylabel('$x_2$', 'Fontsize', 28, 'Interpreter', 'Latex');
+zlabel('$x_3$', 'Fontsize', 28, 'Interpreter', 'Latex');
+
+%% Time-based plots
+% Plot demonstrations of velocity manipulability ellipsoids over time
+figure('position',[10 10 1200 550],'color',[1 1 1]);
+clrmap = lines(nbSamples);
+subplot(2,2,1); hold on;
+title('\fontsize{12}Demonstrated manipulability');
+for n=1:nbSamples
+    for t=round(linspace(1,nbData,15))
+        plotGMM([t;0;0], X(2:4,2:4,t+(n-1)*nbData), clrmap(n,:), .4);
+    end
+end
+xaxis(-10, nbData+10);
+set(gca, 'FontSize', 16)
+ylabel('{\boldmath$M$}', 'Fontsize', 24, 'Interpreter', 'Latex');
+
+subplot(2,2,3); hold on;
+title('\fontsize{12}Demonstrated manipulability and GMM centers');
+clrmap = lines(modelPD.nbStates);
+sc = 1/modelPD.dt;
+for t=1:size(X,3) % Plotting man. ellipsoids from demonstration data
+    plotGMM([X(in,in,t)*sc; 0; 0], X(outMat,outMat,t), [.6 .6 .6], .1);
+end
+for i=1:modelPD.nbStates % Plotting GMM of man. ellipsoids
+    plotGMM([modelPD.MuMan(in,i)*sc; 0; 0], vec2symmat(modelPD.MuMan(out,i)), clrmap(i,:), .3);
+end
+xaxis(xIn(1)*sc, xIn(end)*sc);
+set(gca, 'FontSize', 16)
+xlabel('$t$', 'Fontsize', 24, 'Interpreter', 'Latex');
+ylabel('{\boldmath$M$}', 'Fontsize', 24, 'Interpreter', 'Latex');
+
+subplot(2,2,2); hold on;
+title('\fontsize{12}Desired manipulability profile (GMR)');
+for t=1:7:nbData % Plotting estimated man. ellipsoid from GMR
+    plotGMM([xIn(1,t)*sc; 0; 0], vec2symmat(xhat(:,t)), [0.2 0.8 0.2], .5, '-.', 2, 1);
+end
+axis([xIn(1)*sc, xIn(end)*sc, -15, 15]);
+set(gca, 'FontSize', 16)
+ylabel('{\boldmath$M_d$}', 'Fontsize', 24, 'Interpreter', 'Latex');
+
+subplot(2,2,4); hold on;  % Plotting states influence during GMR estimation
+title('\fontsize{12}Influence of GMM components');
+for i=1:modelPD.nbStates
+    plot(xIn, H(i,:),'linewidth',2,'color',clrmap(i,:));
+end
+axis([xIn(1), xIn(end), 0, 1.02]);
+set(gca, 'FontSize', 16)
+xlabel('$t$', 'Fontsize', 24, 'Interpreter', 'Latex');
+ylabel('$h_k$', 'Fontsize', 24, 'Interpreter', 'Latex');
+
+%% Plots in the SPD space
+figure('position',[10 10 1800 500],'color',[1 1 1]);
+clrmap = lines(nbSamples);
+% Plot demonstrations of velocity manipulability ellipsoids in SPD space
+subplot(1,3,1); hold on;
+title('\fontsize{12}Demonstrations: manipulability ellipsoids');
+r = 200;
+phi = 0:0.1:2*pi+0.1;
+xax = [zeros(size(phi)); r.*ones(size(phi))];
+yax = [zeros(size(phi));r.*sin(phi)];
+zax = [zeros(size(phi));r/sqrt(2).*cos(phi)]; 
+% Cone
+h = mesh(xax,yax,zax,'linestyle','none','facecolor',[.95 .95 .95],'facealpha',.5);
+direction = cross([1 0 0],[1/sqrt(2),1/sqrt(2),0]);
+rotate(h,direction,45,[0,0,0])
+h = plot3(xax(2,:),yax(2,:),zax(2,:),'linewidth',3,'color',[0 0 0]);
+rotate(h,direction,45,[0,0,0])
+h = plot3(xax(:,63),yax(:,63),zax(:,63),'linewidth',3,'color',[0 0 0]);
+rotate(h,direction,45,[0,0,0])
+h = plot3(xax(:,40),yax(:,40),zax(:,40),'linewidth',3,'color',[0 0 0]);
+rotate(h,direction,45,[0,0,0])
+% Draw axis
+plot3([0,250],[0,0],[0,0],'k','linewidth',.5)
+plot3([0,0],[0,250],[0,0],'k','linewidth',.5)
+plot3([0,0],[0,0],[0,150],'k','linewidth',.5)
+% Add text for axis
+text(280,-40,0,'$\mathbf{M}_{11}$','FontSize',20,'Interpreter','latex')
+text(15,0,120,'$\mathbf{M}_{12}$','FontSize',20,'Interpreter','latex')
+text(5,220,-15,'$\mathbf{M}_{22}$','FontSize',20,'Interpreter','latex')
+% Settings
+set(gca,'XTick',[],'YTick',[],'ZTick',[]);
+axis off
+view(70,12);
+% Plot demonstrations
+for n=1:nbSamples
+	for t=1:nbData
+        plot3(x(2, t+(n-1)*nbData), x(3, t+(n-1)*nbData), ... 
+            x(4, t+(n-1)*nbData)/sqrt(2), '.', 'Markersize', 12, 'color', clrmap(n,:));
+    end
+end
+
+% Plot demonstrated manipulability and GMM components in SPD space
+subplot(1,3,2); hold on;
+title('\fontsize{12}Manipulability GMM in SPD space');
+clrmap = lines(modelPD.nbStates);
+r = 200;
+phi = 0:0.1:2*pi+0.1;
+xax = [zeros(size(phi)); r.*ones(size(phi))];
+yax = [zeros(size(phi));r.*sin(phi)];
+zax = [zeros(size(phi));r/sqrt(2).*cos(phi)]; 
+% Cone
+h = mesh(xax,yax,zax,'linestyle','none','facecolor',[.95 .95 .95],'facealpha',.5);
+direction = cross([1 0 0],[1/sqrt(2),1/sqrt(2),0]);
+rotate(h,direction,45,[0,0,0])
+h = plot3(xax(2,:),yax(2,:),zax(2,:),'linewidth',3,'color',[0 0 0]);
+rotate(h,direction,45,[0,0,0])
+h = plot3(xax(:,63),yax(:,63),zax(:,63),'linewidth',3,'color',[0 0 0]);
+rotate(h,direction,45,[0,0,0])
+h = plot3(xax(:,40),yax(:,40),zax(:,40),'linewidth',3,'color',[0 0 0]);
+rotate(h,direction,45,[0,0,0])
+% Draw axis
+plot3([0,250],[0,0],[0,0],'k','linewidth',.5)
+plot3([0,0],[0,250],[0,0],'k','linewidth',.5)
+plot3([0,0],[0,0],[0,150],'k','linewidth',.5)
+% Add text for axis
+text(280,-40,0,'$\mathbf{M}_{11}$','FontSize',20,'Interpreter','latex')
+text(15,0,120,'$\mathbf{M}_{12}$','FontSize',20,'Interpreter','latex')
+text(5,220,-15,'$\mathbf{M}_{22}$','FontSize',20,'Interpreter','latex')
+% Settings
+set(gca,'XTick',[],'YTick',[],'ZTick',[]);
+axis off
+view(70,12);
+% Plot samples
+for n=1:nbSamples
+	for t=1:nbData
+        plot3(x(2, t+(n-1)*nbData), x(3, t+(n-1)*nbData), x(4, t+(n-1)*nbData)/sqrt(2), '.', 'Markersize', 10, 'color', [.6 .6 .6]);
+    end
+end
+for i=1:modelPD.nbStates % Plotting GMM of man. ellipsoids
+    mu = modelPD.MuMan(out,i);
+    mu(3) = mu(3)/sqrt(2); % rescale for plots
+    sigma = modelPD.Sigma(out,out,i);
+    sigma(3,:) = sigma(3,:)./sqrt(2); % rescale for plots
+    sigma(:,3) = sigma(:,3)./sqrt(2); % rescale for plots
+    sigma = sigma + 5*eye(3); % for better visualisaton of the last covariance (really thin along one axis)
+	plotGMM3D(mu, sigma, clrmap(i,:), .6);
+end
+
+subplot(1,3,3); hold on;
+title('\fontsize{12}Desired reproduction');
+r = 200;
+phi = 0:0.1:2*pi+0.1;
+xax = [zeros(size(phi)); r.*ones(size(phi))];
+yax = [zeros(size(phi));r.*sin(phi)];
+zax = [zeros(size(phi));r/sqrt(2).*cos(phi)]; 
+% Cone
+h = mesh(xax,yax,zax,'linestyle','none','facecolor',[.95 .95 .95],'facealpha',.5);
+direction = cross([1 0 0],[1/sqrt(2),1/sqrt(2),0]);
+rotate(h,direction,45,[0,0,0])
+h = plot3(xax(2,:),yax(2,:),zax(2,:),'linewidth',3,'color',[0 0 0]);
+rotate(h,direction,45,[0,0,0])
+h = plot3(xax(:,63),yax(:,63),zax(:,63),'linewidth',3,'color',[0 0 0]);
+rotate(h,direction,45,[0,0,0])
+h = plot3(xax(:,40),yax(:,40),zax(:,40),'linewidth',3,'color',[0 0 0]);
+rotate(h,direction,45,[0,0,0])
+% Draw axis
+plot3([0,250],[0,0],[0,0],'k','linewidth',.5)
+plot3([0,0],[0,250],[0,0],'k','linewidth',.5)
+plot3([0,0],[0,0],[0,150],'k','linewidth',.5)
+% Add text for axis
+text(280,-40,0,'$\mathbf{M}_{11}$','FontSize',20,'Interpreter','latex')
+text(15,0,120,'$\mathbf{M}_{12}$','FontSize',20,'Interpreter','latex')
+text(5,220,-15,'$\mathbf{M}_{22}$','FontSize',20,'Interpreter','latex')
+% Settings
+set(gca,'XTick',[],'YTick',[],'ZTick',[]);
+axis off
+view(70,12);
+% Plot
+plot3(xhat(1, :), xhat(2, :), xhat(3, :)/sqrt(2), '.', 'Markersize', 12, 'color', [0.2 0.8 0.2]);
+end
